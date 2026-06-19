@@ -56,7 +56,7 @@ def run_baseline_eval(config: Dict[str, Any]) -> Path:
     backend = build_backend(config["model"])
     samples = load_vqa_splits(config)
     output_dir = timestamped_output_dir(config, "baseline-eval")
-    rows = _evaluate_samples(backend, samples, context_lookup=None)
+    rows = _evaluate_samples_streaming(backend, samples, output_dir / "per_sample.partial.jsonl", context_lookup=None)
     _write_eval_outputs(output_dir, rows)
     return output_dir
 
@@ -139,31 +139,51 @@ def _evaluate_samples(backend, samples: Iterable[VQASample], context_lookup=None
     rows: List[Dict[str, Any]] = []
     for sample in samples:
         extra = context_lookup.get(sample.sample_id, {}) if context_lookup else {}
-        context = extra.get("context")
-        start = time.time()
-        prediction = backend.generate(sample.image_path, sample.question, context=context)
-        latency_ms = (time.time() - start) * 1000
-        premise = "\n".join(x for x in [context or "", sample.answer] if x)
-        nli = scorer.score(premise=premise, hypothesis=prediction)
-        em = exact_match(prediction, sample.answer)
-        rows.append(
-            {
-                "sample_id": sample.sample_id,
-                "dataset": sample.dataset,
-                "image_path": sample.image_path,
-                "question": sample.question,
-                "reference_answer": sample.answer,
-                "prediction": prediction,
-                "exact_match": em,
-                "nli_label": nli["label"],
-                "nli_confidence": nli["confidence"],
-                "hallucination_category": hallucination_category(prediction, sample.answer, str(nli["label"])),
-                "latency_ms": latency_ms,
-                "context_tokens": extra.get("context_tokens", 0),
-                "retrieval": extra.get("retrieval", []),
-            }
-        )
+        rows.append(_evaluate_sample(backend, sample, scorer, extra))
     return rows
+
+
+def _evaluate_samples_streaming(backend, samples: Iterable[VQASample], partial_path: Path, context_lookup=None) -> List[Dict[str, Any]]:
+    materialized_samples = list(samples)
+    scorer = NLIFactualConsistencyScorer()
+    rows: List[Dict[str, Any]] = []
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with partial_path.open("w", encoding="utf-8") as f:
+        for idx, sample in enumerate(materialized_samples, start=1):
+            extra = context_lookup.get(sample.sample_id, {}) if context_lookup else {}
+            row = _evaluate_sample(backend, sample, scorer, extra)
+            rows.append(row)
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
+            if idx % 10 == 0 or idx == len(materialized_samples):
+                logger.info("Evaluated %d/%d samples", idx, len(materialized_samples))
+    return rows
+
+
+def _evaluate_sample(backend, sample: VQASample, scorer: NLIFactualConsistencyScorer, extra: Dict[str, Any]) -> Dict[str, Any]:
+    context = extra.get("context")
+    start = time.time()
+    prediction = backend.generate(sample.image_path, sample.question, context=context)
+    latency_ms = (time.time() - start) * 1000
+    premise = "\n".join(x for x in [context or "", sample.answer] if x)
+    nli = scorer.score(premise=premise, hypothesis=prediction)
+    em = exact_match(prediction, sample.answer)
+    return {
+        "sample_id": sample.sample_id,
+        "dataset": sample.dataset,
+        "image_path": sample.image_path,
+        "question": sample.question,
+        "reference_answer": sample.answer,
+        "prediction": prediction,
+        "exact_match": em,
+        "nli_label": nli["label"],
+        "nli_confidence": nli["confidence"],
+        "hallucination_category": hallucination_category(prediction, sample.answer, str(nli["label"])),
+        "latency_ms": latency_ms,
+        "context_tokens": extra.get("context_tokens", 0),
+        "retrieval": extra.get("retrieval", []),
+    }
 
 
 def _write_eval_outputs(output_dir: Path, rows: List[Dict[str, Any]]) -> None:

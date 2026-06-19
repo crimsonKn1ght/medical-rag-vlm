@@ -116,6 +116,8 @@ class MedicalRAGTests(unittest.TestCase):
             index_dir = run_build_index(config)
             rag_dir = run_rag_eval(config, mode="hybrid")
 
+            partial_rows = (baseline_dir / "per_sample.partial.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(partial_rows), 1)
             self.assertTrue((baseline_dir / "per_sample.jsonl").exists())
             self.assertTrue((index_dir / "manifest.json").exists())
             self.assertTrue((rag_dir / "aggregate_metrics.json").exists())

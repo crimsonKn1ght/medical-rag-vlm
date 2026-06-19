@@ -16,6 +16,16 @@ class MedicalVLMBackend(ABC):
     def generate(self, image_path: str, question: str, context: Optional[str] = None) -> str:
         raise NotImplementedError
 
+    def generate_batch(self, requests: List[Dict[str, Any]]) -> List[str]:
+        return [
+            self.generate(
+                image_path=str(request["image_path"]),
+                question=str(request["question"]),
+                context=request.get("context"),
+            )
+            for request in requests
+        ]
+
     @abstractmethod
     def encode_image(self, image_path: str, mode: str = "global") -> np.ndarray:
         raise NotImplementedError
@@ -91,6 +101,9 @@ class HuggingFaceMedicalVLMBackend(MedicalVLMBackend):
         return f"Question: {question}"
 
     def generate(self, image_path: str, question: str, context: Optional[str] = None) -> str:
+        return self._generate_serial(image_path, question, context)
+
+    def _generate_serial(self, image_path: str, question: str, context: Optional[str] = None) -> str:
         from PIL import Image
 
         image = Image.open(image_path).convert("RGB")
@@ -119,7 +132,7 @@ class HuggingFaceMedicalVLMBackend(MedicalVLMBackend):
         else:
             inputs = self.processor(images=image, text=prompt, return_tensors="pt").to(self.device)
         input_len = inputs["input_ids"].shape[-1]
-        with self.torch.no_grad():
+        with self.torch.inference_mode():
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
@@ -129,12 +142,77 @@ class HuggingFaceMedicalVLMBackend(MedicalVLMBackend):
         generated = output_ids[0][input_len:]
         return self.processor.decode(generated, skip_special_tokens=True).strip()
 
+    def generate_batch(self, requests: List[Dict[str, Any]]) -> List[str]:
+        if not requests:
+            return []
+
+        from PIL import Image
+
+        images = []
+        prompts = []
+        conversations = []
+        for request in requests:
+            image = Image.open(str(request["image_path"])).convert("RGB")
+            prompt = self._prompt(str(request["question"]), request.get("context"))
+            images.append(image)
+            prompts.append(prompt)
+            conversations.append(
+                [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "You are an expert radiologist."}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": prompt},
+                        ],
+                    },
+                ]
+            )
+        try:
+            if hasattr(self.processor, "apply_chat_template"):
+                inputs = self.processor.apply_chat_template(
+                    conversations,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+            else:
+                inputs = self.processor(images=images, text=prompts, return_tensors="pt", padding=True).to(self.device)
+        except Exception as exc:
+            logger.warning("Batched generation setup failed; falling back to serial generation: %s", exc)
+            return [
+                self._generate_serial(
+                    image_path=str(request["image_path"]),
+                    question=str(request["question"]),
+                    context=request.get("context"),
+                )
+                for request in requests
+            ]
+        input_len = inputs["input_ids"].shape[-1]
+        with self.torch.inference_mode():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                temperature=None,
+            )
+        predictions = []
+        for row_idx in range(len(requests)):
+            generated = output_ids[row_idx][input_len:]
+            predictions.append(self.processor.decode(generated, skip_special_tokens=True).strip())
+        return predictions
+
     def encode_image(self, image_path: str, mode: str = "global") -> np.ndarray:
         from PIL import Image
 
         image = Image.open(image_path).convert("RGB")
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-        with self.torch.no_grad():
+        with self.torch.inference_mode():
             if hasattr(self.model, "get_image_features"):
                 features = self.model.get_image_features(**inputs)
             else:

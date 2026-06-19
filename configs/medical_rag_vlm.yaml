@@ -4,7 +4,12 @@ model:
   device: cuda
   torch_dtype: bfloat16
   trust_remote_code: true
-  max_new_tokens: 64
+  max_new_tokens: 32
+
+evaluation:
+  batch_size: 8
+  nli_model_id: microsoft/deberta-v3-large-mnli
+  deterministic_generation: true
 
 datasets:
   vqa:
@@ -31,10 +36,6 @@ retrieval:
 prompting:
   context_token_budget: 900
   include_scores_in_context: false
-
-evaluation:
-  nli_model_id: microsoft/deberta-v3-large-mnli
-  deterministic_generation: true
 
 outputs:
   root_dir: outputs/medical_rag_vlm

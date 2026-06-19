@@ -56,7 +56,14 @@ def run_baseline_eval(config: Dict[str, Any]) -> Path:
     backend = build_backend(config["model"])
     samples = load_vqa_splits(config)
     output_dir = timestamped_output_dir(config, "baseline-eval")
-    rows = _evaluate_samples_streaming(backend, samples, output_dir / "per_sample.partial.jsonl", context_lookup=None)
+    batch_size = _evaluation_batch_size(config)
+    rows = _evaluate_samples_streaming(
+        backend,
+        samples,
+        output_dir / "per_sample.partial.jsonl",
+        context_lookup=None,
+        batch_size=batch_size,
+    )
     _write_eval_outputs(output_dir, rows)
     return output_dir
 
@@ -129,43 +136,83 @@ def run_rag_eval(config: Dict[str, Any], mode: str) -> Path:
         }
 
     output_dir = timestamped_output_dir(config, f"rag-eval-{mode}")
-    rows = _evaluate_samples(backend, samples, context_lookup=context_lookup)
+    rows = _evaluate_samples(backend, samples, context_lookup=context_lookup, batch_size=_evaluation_batch_size(config))
     _write_eval_outputs(output_dir, rows)
     return output_dir
 
 
-def _evaluate_samples(backend, samples: Iterable[VQASample], context_lookup=None) -> List[Dict[str, Any]]:
+def _evaluation_batch_size(config: Dict[str, Any]) -> int:
+    return max(1, int(config.get("evaluation", {}).get("batch_size", 1)))
+
+
+def _evaluate_samples(backend, samples: Iterable[VQASample], context_lookup=None, batch_size: int = 1) -> List[Dict[str, Any]]:
     scorer = NLIFactualConsistencyScorer()
     rows: List[Dict[str, Any]] = []
-    for sample in samples:
-        extra = context_lookup.get(sample.sample_id, {}) if context_lookup else {}
-        rows.append(_evaluate_sample(backend, sample, scorer, extra))
+    for batch in _sample_batches(list(samples), batch_size):
+        rows.extend(_evaluate_batch(backend, batch, scorer, context_lookup=context_lookup))
     return rows
 
 
-def _evaluate_samples_streaming(backend, samples: Iterable[VQASample], partial_path: Path, context_lookup=None) -> List[Dict[str, Any]]:
+def _evaluate_samples_streaming(
+    backend,
+    samples: Iterable[VQASample],
+    partial_path: Path,
+    context_lookup=None,
+    batch_size: int = 1,
+) -> List[Dict[str, Any]]:
     materialized_samples = list(samples)
     scorer = NLIFactualConsistencyScorer()
     rows: List[Dict[str, Any]] = []
     partial_path.parent.mkdir(parents=True, exist_ok=True)
 
     with partial_path.open("w", encoding="utf-8") as f:
-        for idx, sample in enumerate(materialized_samples, start=1):
-            extra = context_lookup.get(sample.sample_id, {}) if context_lookup else {}
-            row = _evaluate_sample(backend, sample, scorer, extra)
-            rows.append(row)
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for batch in _sample_batches(materialized_samples, batch_size):
+            batch_rows = _evaluate_batch(backend, batch, scorer, context_lookup=context_lookup)
+            rows.extend(batch_rows)
+            for row in batch_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
-            if idx % 10 == 0 or idx == len(materialized_samples):
-                logger.info("Evaluated %d/%d samples", idx, len(materialized_samples))
+            completed = len(rows)
+            previous_completed = completed - len(batch_rows)
+            if completed // 10 > previous_completed // 10 or completed == len(materialized_samples):
+                logger.info("Evaluated %d/%d samples", completed, len(materialized_samples))
     return rows
 
 
-def _evaluate_sample(backend, sample: VQASample, scorer: NLIFactualConsistencyScorer, extra: Dict[str, Any]) -> Dict[str, Any]:
-    context = extra.get("context")
+def _sample_batches(samples: List[VQASample], batch_size: int) -> Iterable[List[VQASample]]:
+    for start in range(0, len(samples), max(1, batch_size)):
+        yield samples[start : start + max(1, batch_size)]
+
+
+def _evaluate_batch(backend, samples: List[VQASample], scorer: NLIFactualConsistencyScorer, context_lookup=None) -> List[Dict[str, Any]]:
+    extras = [context_lookup.get(sample.sample_id, {}) if context_lookup else {} for sample in samples]
+    requests = [
+        {
+            "image_path": sample.image_path,
+            "question": sample.question,
+            "context": extra.get("context"),
+        }
+        for sample, extra in zip(samples, extras)
+    ]
     start = time.time()
-    prediction = backend.generate(sample.image_path, sample.question, context=context)
-    latency_ms = (time.time() - start) * 1000
+    predictions = backend.generate_batch(requests)
+    if len(predictions) != len(samples):
+        raise RuntimeError(f"Backend returned {len(predictions)} predictions for {len(samples)} samples")
+    latency_ms = ((time.time() - start) * 1000) / max(len(samples), 1)
+    return [
+        _evaluate_prediction(sample, prediction, scorer, extra, latency_ms)
+        for sample, prediction, extra in zip(samples, predictions, extras)
+    ]
+
+
+def _evaluate_prediction(
+    sample: VQASample,
+    prediction: str,
+    scorer: NLIFactualConsistencyScorer,
+    extra: Dict[str, Any],
+    latency_ms: float,
+) -> Dict[str, Any]:
+    context = extra.get("context")
     premise = "\n".join(x for x in [context or "", sample.answer] if x)
     nli = scorer.score(premise=premise, hypothesis=prediction)
     em = exact_match(prediction, sample.answer)

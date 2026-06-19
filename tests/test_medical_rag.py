@@ -86,7 +86,12 @@ class MedicalRAGTests(unittest.TestCase):
             )
             vqa_path = root / "vqa.json"
             vqa_path.write_text(
-                json.dumps([{"id": "q1", "image": "q.png", "question": "What disease is present?", "answer": "pneumonia"}]),
+                json.dumps(
+                    [
+                        {"id": "q1", "image": "q.png", "question": "What disease is present?", "answer": "pneumonia"},
+                        {"id": "q2", "image": "q.png", "question": "What abnormality is present?", "answer": "pneumonia"},
+                    ]
+                ),
                 encoding="utf-8",
             )
             manifest = root / "manifest.csv"
@@ -110,6 +115,7 @@ class MedicalRAGTests(unittest.TestCase):
                     "rerank": True,
                 },
                 "prompting": {"context_token_budget": 50},
+                "evaluation": {"batch_size": 2},
                 "outputs": {"root_dir": str(root / "outputs")},
             }
             baseline_dir = run_baseline_eval(config)
@@ -117,7 +123,7 @@ class MedicalRAGTests(unittest.TestCase):
             rag_dir = run_rag_eval(config, mode="hybrid")
 
             partial_rows = (baseline_dir / "per_sample.partial.jsonl").read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(partial_rows), 1)
+            self.assertEqual(len(partial_rows), 2)
             self.assertTrue((baseline_dir / "per_sample.jsonl").exists())
             self.assertTrue((index_dir / "manifest.json").exists())
             self.assertTrue((rag_dir / "aggregate_metrics.json").exists())

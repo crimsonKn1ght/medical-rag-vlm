@@ -1,0 +1,40 @@
+model:
+  type: huggingface
+  model_id: google/medgemma-4b-it
+  device: cuda
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  max_new_tokens: 64
+
+datasets:
+  vqa:
+    - name: vqa_rad
+      path: datasets/vqa_rad/test.json
+      image_root: datasets/vqa_rad/images
+    - name: pathvqa
+      path: datasets/pathvqa/test.json
+      image_root: datasets/pathvqa/images
+  mimic_cxr:
+    manifest_path: datasets/mimic_cxr/manifest.csv
+    image_root: datasets/mimic_cxr/images
+    report_root: datasets/mimic_cxr/reports
+
+retrieval:
+  index_dir: outputs/indexes/mimic_cxr
+  top_k: 3
+  candidate_pool_size: 10
+  visual_weight: 0.5
+  text_weight: 0.5
+  rerank: true
+  reranker_model_id: cross-encoder/ms-marco-MiniLM-L-6-v2
+
+prompting:
+  context_token_budget: 900
+  include_scores_in_context: false
+
+evaluation:
+  nli_model_id: microsoft/deberta-v3-large-mnli
+  deterministic_generation: true
+
+outputs:
+  root_dir: outputs/medical_rag_vlm

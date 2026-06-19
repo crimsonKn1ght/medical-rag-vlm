@@ -1,0 +1,7 @@
+.claude/
+.venv/
+__pycache__/
+checkpoints/
+datasets/llava_recap_558k/
+outputs/
+.pytest_cache/

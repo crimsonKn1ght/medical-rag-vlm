@@ -95,7 +95,30 @@ class HuggingFaceMedicalVLMBackend(MedicalVLMBackend):
 
         image = Image.open(image_path).convert("RGB")
         prompt = self._prompt(question, context)
-        inputs = self.processor(images=image, text=prompt, return_tensors="pt").to(self.device)
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "You are an expert radiologist."}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+        if hasattr(self.processor, "apply_chat_template"):
+            inputs = self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(self.device)
+        else:
+            inputs = self.processor(images=image, text=prompt, return_tensors="pt").to(self.device)
+        input_len = inputs["input_ids"].shape[-1]
         with self.torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
@@ -103,7 +126,8 @@ class HuggingFaceMedicalVLMBackend(MedicalVLMBackend):
                 do_sample=False,
                 temperature=None,
             )
-        return self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        generated = output_ids[0][input_len:]
+        return self.processor.decode(generated, skip_special_tokens=True).strip()
 
     def encode_image(self, image_path: str, mode: str = "global") -> np.ndarray:
         from PIL import Image
